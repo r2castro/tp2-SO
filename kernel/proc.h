@@ -104,4 +104,16 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // data for lottery scheduler
+  int tickets;
+  int ticks;
 };
+
+struct proc_table {
+  struct proc proc[NPROC];
+  struct spinlock lock;
+};
+
+extern struct proc_table ptable;
+void setproctickets(struct proc *proc, int ntickets);

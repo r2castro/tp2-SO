@@ -6,9 +6,12 @@
 #include "proc.h"
 #include "defs.h"
 
+#include "pstat.h"
+
 struct cpu cpus[NCPU];
 
-struct proc proc[NPROC];
+// implement lock for proctable
+struct proc_table ptable;
 
 struct proc *initproc;
 
@@ -26,6 +29,31 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+// total number of tickets
+int gtickets = 0;
+
+// lock for messing with gticket
+struct spinlock ticket_lock;
+
+
+// New code: Random functions
+static uint64 seed;
+
+void
+srand(uint64 new_seed)
+{
+  seed = new_seed;
+}
+
+// values chosen from Knuth's MMIX
+uint64
+rand()
+{
+  seed = (6364136223846793005 * seed + 1442695040888963407);
+  //modulo is unnecessary, as seed will overflow on 2^64
+  return seed;
+}
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -34,11 +62,11 @@ proc_mapstacks(pagetable_t kpgtbl)
 {
   struct proc *p;
   
-  for(p = proc; p < &proc[NPROC]; p++) {
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
     char *pa = kalloc();
     if(pa == 0)
       panic("kalloc");
-    uint64 va = KSTACK((int) (p - proc));
+    uint64 va = KSTACK((int) (p - ptable.proc));
     kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
   }
 }
@@ -51,10 +79,12 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
-  for(p = proc; p < &proc[NPROC]; p++) {
+  initlock(&ptable.lock, "ptable_lock");
+  uint64 i = 0;
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++, i++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
-      p->kstack = KSTACK((int) (p - proc));
+      p->kstack = KSTACK((int) (p - ptable.proc));
   }
 }
 
@@ -111,7 +141,8 @@ allocproc(void)
 {
   struct proc *p;
 
-  for(p = proc; p < &proc[NPROC]; p++) {
+  int i =0;
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++, i++) {
     acquire(&p->lock);
     if(p->state == UNUSED) {
       goto found;
@@ -124,6 +155,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -169,6 +201,8 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  //  avoid scheduling issues
+  p->tickets = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -251,6 +285,10 @@ userinit(void)
 
   p->state = RUNNABLE;
 
+  // give 1 ticket for init
+  p->tickets = 1;
+  gtickets += 1;
+
   release(&p->lock);
 }
 
@@ -315,7 +353,14 @@ fork(void)
   release(&np->lock);
 
   acquire(&wait_lock);
+  acquire(&ticket_lock);
   np->parent = p;
+
+  // child initially has same tickets as parent
+  np->tickets = p->tickets;
+  gtickets += p->tickets;
+
+  release(&ticket_lock);
   release(&wait_lock);
 
   acquire(&np->lock);
@@ -332,7 +377,7 @@ reparent(struct proc *p)
 {
   struct proc *pp;
 
-  for(pp = proc; pp < &proc[NPROC]; pp++){
+  for(pp = ptable.proc; pp < &ptable.proc[NPROC]; pp++){
     if(pp->parent == p){
       pp->parent = initproc;
       wakeup(initproc);
@@ -380,6 +425,11 @@ exit(int status)
 
   release(&wait_lock);
 
+  acquire(&ticket_lock);
+  gtickets -= p->tickets;
+  p->tickets = 0;
+  release(&ticket_lock);
+
   // Jump into the scheduler, never to return.
   sched();
   panic("zombie exit");
@@ -399,7 +449,7 @@ wait(uint64 addr)
   for(;;){
     // Scan through table looking for exited children.
     havekids = 0;
-    for(pp = proc; pp < &proc[NPROC]; pp++){
+    for(pp = ptable.proc; pp < &ptable.proc[NPROC]; pp++){
       if(pp->parent == p){
         // make sure the child isn't still in exit() or swtch().
         acquire(&pp->lock);
@@ -447,24 +497,44 @@ scheduler(void)
   struct proc *p;
   struct cpu *c = mycpu();
   
+  int ticket_value;
   c->proc = 0;
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
+    
+    acquire(&ticket_lock);
+    ticket_value = rand() % gtickets;
+    release(&ticket_lock);
 
-    for(p = proc; p < &proc[NPROC]; p++) {
+
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
       acquire(&p->lock);
+
+      // subtract each process tickets until there are zero tickets available
+      // even if process is not runnable
+      // if process is not allocated, tickets will be 0
+      ticket_value -= p->tickets;
+
       if(p->state == RUNNABLE) {
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+        if (ticket_value <= 0){
+
+          p->state = RUNNING;
+          c->proc = p;
+          int before_ticks = ticks;
+          swtch(&c->context, &p->context);
+          p->ticks += (ticks - before_ticks);
+
+          // Process is done running for now.
+          // It should have changed its p->state before coming back.
+          c->proc = 0;
+        }
+        release(&p->lock);
+        break;
       }
       release(&p->lock);
     }
@@ -568,7 +638,7 @@ wakeup(void *chan)
 {
   struct proc *p;
 
-  for(p = proc; p < &proc[NPROC]; p++) {
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
     if(p != myproc()){
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
@@ -587,7 +657,7 @@ kill(int pid)
 {
   struct proc *p;
 
-  for(p = proc; p < &proc[NPROC]; p++){
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     acquire(&p->lock);
     if(p->pid == pid){
       p->killed = 1;
@@ -670,7 +740,7 @@ procdump(void)
   char *state;
 
   printf("\n");
-  for(p = proc; p < &proc[NPROC]; p++){
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     if(p->state == UNUSED)
       continue;
     if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
@@ -680,4 +750,14 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+
+void setproctickets(struct proc *proc, int ntickets){
+  acquire(&proc->lock);
+  acquire(&ticket_lock);
+  gtickets = ntickets - proc->tickets;
+  proc->tickets = ntickets;
+  release(&ticket_lock);
+  release(&proc->lock);
 }
